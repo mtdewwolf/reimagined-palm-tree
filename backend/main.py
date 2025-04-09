@@ -7,6 +7,7 @@ import json
 import asyncio
 from datetime import datetime
 from .auth import authenticate_user, create_access_token, get_current_user
+from pydantic import BaseModel
 
 app = FastAPI()
 
@@ -21,6 +22,12 @@ app.add_middleware(
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
+
+# Pydantic models
+class Vehicle(BaseModel):
+    license_plate: str
+    vehicle_type: str
+    description: Optional[str] = None
 
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -90,6 +97,88 @@ async def get_vehicles(current_user: dict = Depends(get_current_user)):
         "vehicle_type": v[2],
         "description": v[3]
     } for v in vehicles]
+
+@app.post("/api/vehicles")
+async def create_vehicle(vehicle: Vehicle, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect('weighing_system.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT INTO vehicles (license_plate, vehicle_type, description)
+            VALUES (?, ?, ?)
+        ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description))
+        
+        # Log the action
+        cursor.execute('''
+            INSERT INTO audit_log (user_id, action, details)
+            VALUES (?, ?, ?)
+        ''', (current_user["id"], 'VEHICLE_CREATED', f"License Plate: {vehicle.license_plate}"))
+        
+        conn.commit()
+        return {"message": "Vehicle created successfully"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="License plate already exists")
+    finally:
+        conn.close()
+
+@app.put("/api/vehicles/{vehicle_id}")
+async def update_vehicle(
+    vehicle_id: int,
+    vehicle: Vehicle,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = sqlite3.connect('weighing_system.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE vehicles
+            SET license_plate = ?, vehicle_type = ?, description = ?
+            WHERE id = ?
+        ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description, vehicle_id))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+            
+        # Log the action
+        cursor.execute('''
+            INSERT INTO audit_log (user_id, action, details)
+            VALUES (?, ?, ?)
+        ''', (current_user["id"], 'VEHICLE_UPDATED', f"ID: {vehicle_id}, License Plate: {vehicle.license_plate}"))
+        
+        conn.commit()
+        return {"message": "Vehicle updated successfully"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="License plate already exists")
+    finally:
+        conn.close()
+
+@app.delete("/api/vehicles/{vehicle_id}")
+async def delete_vehicle(vehicle_id: int, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect('weighing_system.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Get vehicle info for audit log
+        cursor.execute('SELECT license_plate FROM vehicles WHERE id = ?', (vehicle_id,))
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+            
+        # Delete the vehicle
+        cursor.execute('DELETE FROM vehicles WHERE id = ?', (vehicle_id,))
+        
+        # Log the action
+        cursor.execute('''
+            INSERT INTO audit_log (user_id, action, details)
+            VALUES (?, ?, ?)
+        ''', (current_user["id"], 'VEHICLE_DELETED', f"ID: {vehicle_id}, License Plate: {result[0]}"))
+        
+        conn.commit()
+        return {"message": "Vehicle deleted successfully"}
+    finally:
+        conn.close()
 
 @app.get("/api/audit-log")
 async def get_audit_log(

@@ -1,11 +1,12 @@
 from fastapi import FastAPI, WebSocket, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordRequestForm
 from typing import List, Optional
 import sqlite3
 import json
 import asyncio
 from datetime import datetime
+from .auth import authenticate_user, create_access_token, get_current_user
 
 app = FastAPI()
 
@@ -20,6 +21,18 @@ app.add_middleware(
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
+
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = await authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer", "user": user}
 
 @app.websocket("/ws/weight")
 async def websocket_endpoint(websocket: WebSocket):
@@ -38,7 +51,7 @@ async def websocket_endpoint(websocket: WebSocket):
         active_connections.remove(websocket)
 
 @app.get("/api/weights")
-async def get_weights(limit: int = 10):
+async def get_weights(limit: int = 10, current_user: dict = Depends(get_current_user)):
     conn = sqlite3.connect('weighing_system.db')
     cursor = conn.cursor()
     cursor.execute('''
@@ -58,6 +71,52 @@ async def get_weights(limit: int = 10):
         "license_plate": w[2],
         "operator": w[3]
     } for w in weights]
+
+@app.get("/api/vehicles")
+async def get_vehicles(current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect('weighing_system.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, license_plate, vehicle_type, description
+        FROM vehicles
+        ORDER BY license_plate
+    ''')
+    vehicles = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        "id": v[0],
+        "license_plate": v[1],
+        "vehicle_type": v[2],
+        "description": v[3]
+    } for v in vehicles]
+
+@app.get("/api/audit-log")
+async def get_audit_log(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+        
+    conn = sqlite3.connect('weighing_system.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.timestamp, u.username, a.action, a.details
+        FROM audit_log a
+        LEFT JOIN users u ON a.user_id = u.id
+        ORDER BY a.timestamp DESC
+        LIMIT ?
+    ''', (limit,))
+    logs = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        "timestamp": l[0],
+        "username": l[1],
+        "action": l[2],
+        "details": l[3]
+    } for l in logs]
 
 if __name__ == "__main__":
     import uvicorn

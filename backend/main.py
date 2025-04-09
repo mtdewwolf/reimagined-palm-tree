@@ -1,7 +1,7 @@
 from fastapi import FastAPI, WebSocket, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any
 import sqlite3
 import json
 import asyncio
@@ -19,6 +19,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Database utility functions
+def get_db_connection():
+    """Returns a database connection with context manager support"""
+    return sqlite3.connect('weighing_system.db')
+
+async def execute_transaction(queries: List[Tuple[str, Tuple[Any, ...]]]) -> sqlite3.Cursor:
+    """Execute multiple queries in a single transaction"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            for query, params in queries:
+                cursor.execute(query, params)
+            conn.commit()
+            return cursor
+        except Exception as e:
+            conn.rollback()
+            raise e
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
@@ -100,27 +118,20 @@ async def get_vehicles(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/vehicles")
 async def create_vehicle(vehicle: Vehicle, current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect('weighing_system.db')
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute('''
-            INSERT INTO vehicles (license_plate, vehicle_type, description)
-            VALUES (?, ?, ?)
-        ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description))
-        
-        # Log the action
-        cursor.execute('''
-            INSERT INTO audit_log (user_id, action, details)
-            VALUES (?, ?, ?)
-        ''', (current_user["id"], 'VEHICLE_CREATED', f"License Plate: {vehicle.license_plate}"))
-        
-        conn.commit()
+        await execute_transaction([
+            ('''
+                INSERT INTO vehicles (license_plate, vehicle_type, description)
+                VALUES (?, ?, ?)
+            ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description)),
+            ('''
+                INSERT INTO audit_log (user_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (current_user["id"], 'VEHICLE_CREATED', f"License Plate: {vehicle.license_plate}"))
+        ])
         return {"message": "Vehicle created successfully"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="License plate already exists")
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=400, detail="License plate already exists") from e
 
 @app.put("/api/vehicles/{vehicle_id}")
 async def update_vehicle(
@@ -128,57 +139,51 @@ async def update_vehicle(
     vehicle: Vehicle,
     current_user: dict = Depends(get_current_user)
 ):
-    conn = sqlite3.connect('weighing_system.db')
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute('''
-            UPDATE vehicles
-            SET license_plate = ?, vehicle_type = ?, description = ?
-            WHERE id = ?
-        ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description, vehicle_id))
+        cursor = await execute_transaction([
+            ('''
+                UPDATE vehicles
+                SET license_plate = ?, vehicle_type = ?, description = ?
+                WHERE id = ?
+            ''', (vehicle.license_plate, vehicle.vehicle_type, vehicle.description, vehicle_id)),
+            ('''
+                INSERT INTO audit_log (user_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (current_user["id"], 'VEHICLE_UPDATED', f"ID: {vehicle_id}, License Plate: {vehicle.license_plate}"))
+        ])
         
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Vehicle not found")
             
-        # Log the action
-        cursor.execute('''
-            INSERT INTO audit_log (user_id, action, details)
-            VALUES (?, ?, ?)
-        ''', (current_user["id"], 'VEHICLE_UPDATED', f"ID: {vehicle_id}, License Plate: {vehicle.license_plate}"))
-        
-        conn.commit()
         return {"message": "Vehicle updated successfully"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="License plate already exists")
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=400, detail="License plate already exists") from e
 
 @app.delete("/api/vehicles/{vehicle_id}")
 async def delete_vehicle(vehicle_id: int, current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect('weighing_system.db')
-    cursor = conn.cursor()
-    
     try:
         # Get vehicle info for audit log
-        cursor.execute('SELECT license_plate FROM vehicles WHERE id = ?', (vehicle_id,))
-        result = cursor.fetchone()
-        if not result:
-            raise HTTPException(status_code=404, detail="Vehicle not found")
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT license_plate FROM vehicles WHERE id = ?', (vehicle_id,))
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Vehicle not found")
             
-        # Delete the vehicle
-        cursor.execute('DELETE FROM vehicles WHERE id = ?', (vehicle_id,))
+            license_plate = result[0]
         
-        # Log the action
-        cursor.execute('''
-            INSERT INTO audit_log (user_id, action, details)
-            VALUES (?, ?, ?)
-        ''', (current_user["id"], 'VEHICLE_DELETED', f"ID: {vehicle_id}, License Plate: {result[0]}"))
+        # Delete vehicle and log the action
+        await execute_transaction([
+            ('DELETE FROM vehicles WHERE id = ?', (vehicle_id,)),
+            ('''
+                INSERT INTO audit_log (user_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (current_user["id"], 'VEHICLE_DELETED', f"ID: {vehicle_id}, License Plate: {license_plate}"))
+        ])
         
-        conn.commit()
         return {"message": "Vehicle deleted successfully"}
-    finally:
-        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 @app.get("/api/audit-log")
 async def get_audit_log(
